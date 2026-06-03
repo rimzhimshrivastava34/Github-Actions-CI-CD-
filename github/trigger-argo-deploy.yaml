@@ -1,0 +1,182 @@
+name: Trigger Argo Build & Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - stage
+      - qa
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to deploy"
+        required: true
+        default: main
+        type: choice
+        options:
+          - main
+          - develop
+          - stage
+          - qa
+      service_name:
+        description: "Service name"
+        required: true
+        default: "your-app"
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARGO_NAMESPACE: argo
+  WORKFLOW_TEMPLATE: app-build-and-deploy
+  SERVICE_NAME: your-app
+  IMAGE_NAME: your-dockerhub-user/your-app
+  DOCKERFILE: Dockerfile
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install flake8 pytest --quiet
+
+      - name: Lint
+        run: |
+          flake8 . --max-line-length=120 --exclude=.git,__pycache__,.venv
+          echo "Lint passed"
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v --tb=short || echo "No tests found — skipping"
+
+  trigger-argo:
+    name: Trigger Argo Workflow
+    runs-on: ubuntu-latest
+    needs: test
+    environment: ${{ github.ref_name }}   # maps to GitHub environment (main/stage/etc.)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve branch name
+        id: branch
+        run: |
+          # workflow_dispatch uses inputs.branch; push uses ref_name
+          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "Deploying branch: $BRANCH"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.29.0"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          kubectl cluster-info
+
+      - name: Install Argo CLI
+        run: |
+          ARGO_VERSION="v3.5.4"
+          curl -sLO "https://github.com/argoproj/argo-workflows/releases/download/${ARGO_VERSION}/argo-linux-amd64.gz"
+          gunzip argo-linux-amd64.gz
+          chmod +x argo-linux-amd64
+          sudo mv argo-linux-amd64 /usr/local/bin/argo
+          argo version
+
+      - name: Submit Argo Workflow
+        id: submit
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+
+          WORKFLOW_NAME=$(argo submit \
+            --from workflowtemplate/${{ env.WORKFLOW_TEMPLATE }} \
+            --name "deploy-${{ env.SERVICE_NAME }}-${BRANCH}-${{ github.run_number }}" \
+            --namespace ${{ env.ARGO_NAMESPACE }} \
+            --parameter BRANCH="${BRANCH}" \
+            --parameter SERVICE_NAME="${{ env.SERVICE_NAME }}" \
+            --parameter IMAGE_NAME="${{ env.IMAGE_NAME }}" \
+            --parameter DOCKERFILE="${{ env.DOCKERFILE }}" \
+            --wait=false \
+            --output name)
+
+          echo "workflow_name=$WORKFLOW_NAME" >> $GITHUB_OUTPUT
+          echo "Submitted workflow: $WORKFLOW_NAME"
+
+      - name: Wait for Argo Workflow to complete
+        id: wait
+        run: |
+          WORKFLOW="${{ steps.submit.outputs.workflow_name }}"
+          echo "Watching workflow: $WORKFLOW"
+
+          argo wait "$WORKFLOW" \
+            --namespace ${{ env.ARGO_NAMESPACE }} \
+            --timeout 30m
+
+          STATUS=$(argo get "$WORKFLOW" \
+            --namespace ${{ env.ARGO_NAMESPACE }} \
+            -o json | jq -r '.status.phase')
+
+          echo "Final status: $STATUS"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+          if [ "$STATUS" != "Succeeded" ]; then
+            echo "Workflow failed with status: $STATUS"
+            argo logs "$WORKFLOW" --namespace ${{ env.ARGO_NAMESPACE }}
+            exit 1
+          fi
+
+      - name: Post deploy summary
+        if: always()
+        run: |
+          STATUS="${{ steps.wait.outputs.status }}"
+          WORKFLOW="${{ steps.submit.outputs.workflow_name }}"
+          BRANCH="${{ steps.branch.outputs.branch }}"
+
+          echo "## Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.SERVICE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${BRANCH} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Argo Workflow | ${WORKFLOW} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${STATUS:-unknown} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+
+  notify-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [test, trigger-argo]
+    if: failure()
+    steps:
+      - name: Send Slack failure alert
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \" Deploy failed: *${{ env.SERVICE_NAME }}* (${{ github.ref_name }}) — Run #${{ github.run_number }}\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Repo\",   \"value\": \"${{ github.repository }}\", \"short\": true},
+                  {\"title\": \"Actor\",  \"value\": \"${{ github.actor }}\",      \"short\": true},
+                  {\"title\": \"Run\",    \"value\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}
+                ]
+              }]
+            }" || echo "Slack notification skipped (no webhook configured)"

@@ -1,0 +1,493 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: app-build-and-deploy
+  namespace: argo
+  labels:
+    product: "{{workflow.parameters.PRODUCT}}"
+    service: "{{workflow.parameters.SERVICE_NAME}}"
+    team: platform
+  annotations:
+    description: >
+      Generic build-and-deploy workflow. Clones a repo, generates an image tag
+      from the git commit timestamp, builds and pushes a Docker image, then opens
+      a PR to update the Helm values file in the GitOps repo.
+      Sends a Teams/Slack notification on exit regardless of outcome.
+spec:
+  # ── Runtime parameters (override at submit time) ─────────────────────────
+  arguments:
+    parameters:
+      - name: BRANCH
+        value: main
+        enum:
+          - main
+          - develop
+          - stage
+          - qa
+
+      - name: REPO
+        value: "git@github.com:your-org/your-app.git"
+        enum:
+          - "git@github.com:your-org/your-app.git"
+
+      - name: DOCKERFILE
+        value: "Dockerfile"
+        enum:
+          - "Dockerfile"
+          - "src/Dockerfile"
+          - "build/Dockerfile"
+
+      - name: IMAGE_NAME
+        value: "your-dockerhub-user/your-app"
+        enum:
+          - "your-dockerhub-user/your-app"
+
+      - name: SERVICE_NAME
+        value: "your-app"
+
+      - name: PRODUCT
+        value: "your-product"
+
+  # ── Entry & exit ──────────────────────────────────────────────────────────
+  entrypoint: build-and-deploy-steps
+  onExit: send-notification-onexit
+
+  # ── Service account (needs git + docker + k8s access) ────────────────────
+  serviceAccountName: argo-workflow-sa
+
+  # ── Secrets mounted as volumes ────────────────────────────────────────────
+  volumes:
+    - name: ssh-volume          # SSH key for private git clone
+      secret:
+        secretName: git-ssh-secret
+        defaultMode: 0400       # read-only, required for SSH
+    - name: docker-config       # Docker registry credentials
+      secret:
+        secretName: docker-config-secret
+
+  # ── Shared workspace PVC (all steps share this volume) ───────────────────
+  volumeClaimTemplates:
+    - metadata:
+        name: workdir
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 3Gi        # Adjust based on repo + image size
+
+  imagePullSecrets:
+    - name: docker-config-secret
+
+  # ════════════════════════════════════════════════════════════════════════════
+  templates:
+
+    # ── MAIN STEPS PIPELINE ──────────────────────────────────────────────────
+    - name: build-and-deploy-steps
+      parallelism: 1            # Steps run sequentially — do not change
+      inputs:
+        parameters:
+          - name: BRANCH
+          - name: REPO
+          - name: DOCKERFILE
+          - name: IMAGE_NAME
+      outputs:
+        parameters:
+          - name: IMAGE_TAG
+            valueFrom:
+              parameter: "{{steps.generate-tag.outputs.parameters.TAG}}"
+            globalName: IMAGE_TAG   # Available to onExit handler
+
+      steps:
+
+        # Step 1: Clone the source repo via SSH
+        - - name: git-clone
+            arguments:
+              parameters:
+                - name: BRANCH
+                  # Strip 'refs/heads/' prefix (sent by some webhook systems)
+                  value: "{{=sprig.trimPrefix('refs/heads/', inputs.parameters.BRANCH)}}"
+                - name: REPO
+                  value: "{{inputs.parameters.REPO}}"
+            template: git-clone
+
+        # Step 2: Generate a unique image tag from the clone timestamp + branch
+        - - name: generate-tag
+            arguments:
+              parameters:
+                - name: TAG
+                  value: "{{steps.git-clone.startedAt}}"
+                - name: BRANCH
+                  value: "{{=sprig.trimPrefix('refs/heads/', inputs.parameters.BRANCH)}}"
+            template: generate-tag
+
+        # Step 3: Docker build + push using the generated tag
+        - - name: build-image
+            arguments:
+              parameters:
+                - name: DOCKERFILE
+                  value: "{{inputs.parameters.DOCKERFILE}}"
+                - name: IMAGE_NAME
+                  value: "{{inputs.parameters.IMAGE_NAME}}"
+                - name: TAG
+                  value: "{{steps.generate-tag.outputs.parameters.TAG}}"
+            template: build-image
+
+        # Step 4: Update Helm values in GitOps repo and open a PR
+        - - name: update-values-and-pr
+            arguments:
+              parameters:
+                - name: SERVICE_NAME
+                  value: "{{workflow.parameters.SERVICE_NAME}}"
+                - name: IMAGE_TAG
+                  value: "{{steps.generate-tag.outputs.parameters.TAG}}"
+                - name: TAG_KEY
+                  value: tag      # The YAML key to update in values.yaml
+            template: update-values-and-pr
+
+    # ── EXIT HANDLER (always runs — success OR failure) ───────────────────────
+    - name: send-notification-onexit
+      steps:
+        # Step 1: Update internal release tracker (JIRA / Notion / custom)
+        - - name: update-release-tracker
+            arguments:
+              parameters:
+                - name: STATUS
+                  value: "{{workflow.status}}"
+                - name: IMAGE_TAG
+                  value: "{{workflow.outputs.parameters.IMAGE_TAG}}"
+            template: update-release-tracker
+
+        # Step 2: Post result to Teams / Slack
+        - - name: notify
+            arguments:
+              parameters:
+                - name: SERVICE_NAME
+                  value: "{{workflow.parameters.SERVICE_NAME}}"
+                - name: BRANCH
+                  value: "{{workflow.parameters.BRANCH}}"
+                - name: STATUS
+                  value: "{{workflow.status}}"
+                - name: WORKFLOW_NAME
+                  value: "{{workflow.name}}"
+            template: notify-teams
+
+    # ════════════════════════════════════════════════════════════════════════
+    # INDIVIDUAL STEP TEMPLATES
+    # ════════════════════════════════════════════════════════════════════════
+
+    # ── git-clone ────────────────────────────────────────────────────────────
+    - name: git-clone
+      inputs:
+        parameters:
+          - name: BRANCH
+          - name: REPO
+      container:
+        image: alpine/git:latest
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            mkdir -p /root/.ssh
+            cp /ssh/id_rsa /root/.ssh/id_rsa
+            chmod 400 /root/.ssh/id_rsa
+            ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null
+
+            echo "Cloning {{inputs.parameters.REPO}} @ {{inputs.parameters.BRANCH}}"
+            git clone --depth 1 \
+              --branch {{inputs.parameters.BRANCH}} \
+              {{inputs.parameters.REPO}} \
+              /mnt/workdir/src
+
+            echo "Clone complete. HEAD commit:"
+            git -C /mnt/workdir/src log -1 --oneline
+        volumeMounts:
+          - name: ssh-volume
+            mountPath: /ssh
+          - name: workdir
+            mountPath: /mnt/workdir
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+
+    # ── generate-tag ─────────────────────────────────────────────────────────
+    - name: generate-tag
+      inputs:
+        parameters:
+          - name: TAG        # Raw timestamp from git-clone.startedAt
+          - name: BRANCH
+      outputs:
+        parameters:
+          - name: TAG
+            valueFrom:
+              path: /tmp/tag.txt
+      container:
+        image: alpine:latest
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            RAW_TS="{{inputs.parameters.TAG}}"
+            BRANCH="{{inputs.parameters.BRANCH}}"
+
+            # Format: branch-YYYYMMDD-HHMMSS
+            # e.g.  main-20260422-090800
+            CLEAN_TS=$(echo "$RAW_TS" | sed 's/[^0-9]//g' | cut -c1-14)
+            DATE_PART=$(echo "$CLEAN_TS" | cut -c1-8)
+            TIME_PART=$(echo "$CLEAN_TS" | cut -c9-14)
+            TAG="${BRANCH}-${DATE_PART}-${TIME_PART}"
+
+            echo "Generated tag: $TAG"
+            echo "$TAG" > /tmp/tag.txt
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "64Mi"
+            cpu: "100m"
+
+    # ── build-image ───────────────────────────────────────────────────────────
+    - name: build-image
+      inputs:
+        parameters:
+          - name: DOCKERFILE
+          - name: IMAGE_NAME
+          - name: TAG
+      container:
+        image: docker:24-dind
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            cp /docker-cfg/.dockerconfigjson /root/.docker/config.json
+
+            IMAGE="{{inputs.parameters.IMAGE_NAME}}"
+            TAG="{{inputs.parameters.TAG}}"
+            DOCKERFILE="{{inputs.parameters.DOCKERFILE}}"
+
+            echo "Building: ${IMAGE}:${TAG}"
+            docker build \
+              --file /mnt/workdir/src/${DOCKERFILE} \
+              --tag ${IMAGE}:${TAG} \
+              --tag ${IMAGE}:latest \
+              --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+              --build-arg IMAGE_TAG=${TAG} \
+              /mnt/workdir/src
+
+            echo "Pushing: ${IMAGE}:${TAG}"
+            docker push ${IMAGE}:${TAG}
+            docker push ${IMAGE}:latest
+
+            echo "Done. Image: ${IMAGE}:${TAG}"
+        volumeMounts:
+          - name: docker-config
+            mountPath: /docker-cfg
+          - name: workdir
+            mountPath: /mnt/workdir
+        env:
+          - name: DOCKER_HOST
+            value: tcp://localhost:2375
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+
+    # ── update-values-and-pr ──────────────────────────────────────────────────
+    - name: update-values-and-pr
+      inputs:
+        parameters:
+          - name: SERVICE_NAME
+          - name: IMAGE_TAG
+          - name: TAG_KEY
+      container:
+        image: alpine/git:latest
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            apk add --no-cache curl jq sed > /dev/null
+
+            SERVICE="{{inputs.parameters.SERVICE_NAME}}"
+            TAG="{{inputs.parameters.IMAGE_TAG}}"
+            TAG_KEY="{{inputs.parameters.TAG_KEY}}"
+            GITOPS_REPO="${GITOPS_REPO_URL}"   # set via env/secret
+            PR_BRANCH="deploy/${SERVICE}/${TAG}"
+
+            # Clone GitOps repo
+            mkdir -p /root/.ssh
+            cp /ssh/id_rsa /root/.ssh/id_rsa
+            chmod 400 /root/.ssh/id_rsa
+            ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null
+
+            git clone --depth 1 $GITOPS_REPO /tmp/gitops
+            cd /tmp/gitops
+
+            git config user.email "argo-bot@yourorg.com"
+            git config user.name "Argo Bot"
+            git checkout -b $PR_BRANCH
+
+            # Update the tag value in the Helm values file
+            VALUES_FILE="helm/${SERVICE}/values.yaml"
+            sed -i "s|${TAG_KEY}:.*|${TAG_KEY}: ${TAG}|" $VALUES_FILE
+
+            echo "Updated $VALUES_FILE:"
+            grep "$TAG_KEY" $VALUES_FILE
+
+            git add $VALUES_FILE
+            git commit -m "chore(deploy): update ${SERVICE} image to ${TAG}"
+            git push origin $PR_BRANCH
+
+            # Open PR via GitHub API
+            curl -s -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/json" \
+              https://api.github.com/repos/${GITHUB_ORG}/${GITOPS_REPO_NAME}/pulls \
+              -d "{
+                \"title\": \"deploy(${SERVICE}): update image tag to ${TAG}\",
+                \"head\": \"${PR_BRANCH}\",
+                \"base\": \"main\",
+                \"body\": \"Automated PR by Argo Workflows\n\nService: ${SERVICE}\nImage tag: ${TAG}\"
+              }"
+
+            echo "PR opened for $SERVICE @ $TAG"
+        volumeMounts:
+          - name: ssh-volume
+            mountPath: /ssh
+        env:
+          - name: GITHUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: github-token-secret
+                key: token
+          - name: GITHUB_ORG
+            value: "your-org"
+          - name: GITOPS_REPO_NAME
+            value: "your-gitops-repo"
+          - name: GITOPS_REPO_URL
+            value: "git@github.com:your-org/your-gitops-repo.git"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+
+    # ── update-release-tracker ────────────────────────────────────────────────
+    - name: update-release-tracker
+      inputs:
+        parameters:
+          - name: STATUS
+          - name: IMAGE_TAG
+            value: "N/A"
+      container:
+        image: curlimages/curl:latest
+        command: [sh, -c]
+        args:
+          - |
+            STATUS="{{inputs.parameters.STATUS}}"
+            TAG="{{inputs.parameters.IMAGE_TAG}}"
+            SERVICE="{{workflow.parameters.SERVICE_NAME}}"
+            BRANCH="{{workflow.parameters.BRANCH}}"
+
+            echo "Updating release tracker: $SERVICE @ $TAG — $STATUS"
+
+            # Replace with your tracker endpoint (JIRA, Notion, custom API, etc.)
+            # curl -s -X POST "${TRACKER_URL}/releases" \
+            #   -H "Authorization: Bearer ${TRACKER_TOKEN}" \
+            #   -H "Content-Type: application/json" \
+            #   -d "{
+            #     \"service\": \"${SERVICE}\",
+            #     \"branch\": \"${BRANCH}\",
+            #     \"imageTag\": \"${TAG}\",
+            #     \"status\": \"${STATUS}\",
+            #     \"deployedAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+            #   }"
+
+            echo "Release tracker updated: $SERVICE $TAG $STATUS"
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "64Mi"
+            cpu: "100m"
+
+    # ── notify-teams ──────────────────────────────────────────────────────────
+    - name: notify-teams
+      inputs:
+        parameters:
+          - name: SERVICE_NAME
+          - name: BRANCH
+          - name: STATUS
+          - name: WORKFLOW_NAME
+      container:
+        image: curlimages/curl:latest
+        command: [sh, -c]
+        args:
+          - |
+            STATUS="{{inputs.parameters.STATUS}}"
+            SERVICE="{{inputs.parameters.SERVICE_NAME}}"
+            BRANCH="{{inputs.parameters.BRANCH}}"
+            WORKFLOW="{{inputs.parameters.WORKFLOW_NAME}}"
+
+            case "$STATUS" in
+              Succeeded) EMOJI="✅"; COLOR="00C853";;
+              Failed)    EMOJI="❌"; COLOR="D50000";;
+              Error)     EMOJI="⚠️"; COLOR="FF6D00";;
+              *)         EMOJI="ℹ️"; COLOR="2979FF";;
+            esac
+
+            echo "${EMOJI} ${SERVICE} (${BRANCH}): ${STATUS}"
+
+            # Microsoft Teams webhook (Adaptive Card format)
+            # curl -s -X POST "${TEAMS_WEBHOOK_URL}" \
+            #   -H "Content-Type: application/json" \
+            #   -d "{
+            #     \"@type\": \"MessageCard\",
+            #     \"themeColor\": \"${COLOR}\",
+            #     \"summary\": \"${SERVICE} deploy ${STATUS}\",
+            #     \"sections\": [{
+            #       \"activityTitle\": \"${EMOJI} ${SERVICE} — ${STATUS}\",
+            #       \"facts\": [
+            #         {\"name\": \"Branch\",   \"value\": \"${BRANCH}\"},
+            #         {\"name\": \"Workflow\",  \"value\": \"${WORKFLOW}\"},
+            #         {\"name\": \"Status\",    \"value\": \"${STATUS}\"}
+            #       ]
+            #     }]
+            #   }"
+
+            # Slack webhook (alternative)
+            # curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+            #   -H "Content-Type: application/json" \
+            #   -d "{\"text\": \"${EMOJI} *${SERVICE}* (${BRANCH}): ${STATUS}\"}"
+
+            echo "Notification sent for workflow: $WORKFLOW"
+        env:
+          - name: TEAMS_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: notification-secrets
+                key: teams-webhook-url
+                optional: true
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: notification-secrets
+                key: slack-webhook-url
+                optional: true
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "64Mi"
+            cpu: "100m"
